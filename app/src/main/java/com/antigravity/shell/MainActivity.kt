@@ -71,7 +71,7 @@ fun AntigravityShellApp() {
     val messages = remember { mutableStateListOf<ChatMessage>() }
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
     var currentTermuxCommand by remember { mutableStateOf("agy") }
-    var serverUrl by remember { mutableStateOf("http://localhost:8080") }
+    var serverUrl by remember { mutableStateOf("http://127.0.0.1:8080") }
     var isConnected by remember { mutableStateOf(false) }
 
     // Init with welcome message
@@ -427,7 +427,7 @@ private fun executeCommandOverNetwork(
         connection.doOutput = true
         connection.setRequestProperty("Content-Type", "application/json")
         connection.connectTimeout = 15000
-        connection.readTimeout = 15000
+        connection.readTimeout = 600000
 
         // Build a JSON payload with prompt and file contents if any
         // For files, we could read their contents and embed them
