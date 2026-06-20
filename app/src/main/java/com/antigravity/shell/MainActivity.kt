@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -37,10 +38,10 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,9 +71,9 @@ fun AntigravityShellApp() {
     var inputText by remember { mutableStateOf("") }
     val messages = remember { mutableStateListOf<ChatMessage>() }
     val attachedFiles = remember { mutableStateListOf<AttachedFile>() }
-    var currentTermuxCommand by remember { mutableStateOf("agy") }
     var serverUrl by remember { mutableStateOf("http://127.0.0.1:8080") }
     var isConnected by remember { mutableStateOf(false) }
+    var isSending by remember { mutableStateOf(false) }
 
     // Init with welcome message
     LaunchedEffect(Unit) {
@@ -99,16 +100,25 @@ fun AntigravityShellApp() {
 
     // Command sender logic
     val sendCommand = {
-        if (inputText.isNotBlank()) {
+        if (!isSending && (inputText.isNotBlank() || attachedFiles.isNotEmpty())) {
             val userText = inputText
-            messages.add(ChatMessage(userText, isUser = true))
+            val filesToSend = attachedFiles.toList()
+            val displayText = when {
+                userText.isNotBlank() -> userText
+                filesToSend.size == 1 -> "Attached ${filesToSend.first().name}"
+                else -> "Attached ${filesToSend.size} files"
+            }
+            messages.add(ChatMessage(displayText, isUser = true))
             inputText = ""
+            attachedFiles.clear()
+            isSending = true
 
             // Send command via Local Server or HTTP API
             CoroutineScope(Dispatchers.IO).launch {
-                val response = executeCommandOverNetwork(serverUrl, userText, attachedFiles.toList(), context)
+                val response = executeCommandOverNetwork(serverUrl, userText, filesToSend, context)
                 CoroutineScope(Dispatchers.Main).launch {
                     messages.add(ChatMessage(response, isUser = false))
+                    isSending = false
                 }
             }
         }
@@ -240,13 +250,21 @@ fun AntigravityShellApp() {
 
                         IconButton(
                             onClick = { sendCommand() },
-                            enabled = inputText.isNotBlank() || attachedFiles.isNotEmpty()
+                            enabled = !isSending && (inputText.isNotBlank() || attachedFiles.isNotEmpty())
                         ) {
-                            Icon(
-                                Icons.Default.Send,
-                                contentDescription = "Send",
-                                tint = if (inputText.isNotBlank() || attachedFiles.isNotEmpty()) PrimaryNeon else SecondaryText
-                            )
+                            if (isSending) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    color = PrimaryNeon,
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Default.Send,
+                                    contentDescription = "Send",
+                                    tint = if (inputText.isNotBlank() || attachedFiles.isNotEmpty()) PrimaryNeon else SecondaryText
+                                )
+                            }
                         }
                     }
                 }
@@ -419,51 +437,62 @@ private fun executeCommandOverNetwork(
     files: List<AttachedFile>,
     context: Context
 ): String {
+    var connection: HttpURLConnection? = null
     return try {
-        // Send a POST request to localhost server running in Termux
-        val url = URL("$serverUrl/prompt")
-        val connection = url.openConnection() as HttpURLConnection
-        connection.requestMethod = "POST"
-        connection.doOutput = true
-        connection.setRequestProperty("Content-Type", "application/json")
-        connection.connectTimeout = 15000
-        connection.readTimeout = 600000
+        val url = URL("${serverUrl.trimEnd('/')}/prompt")
+        val activeConnection = url.openConnection() as HttpURLConnection
+        connection = activeConnection
+        activeConnection.requestMethod = "POST"
+        activeConnection.doOutput = true
+        activeConnection.setRequestProperty("Content-Type", "application/json")
+        activeConnection.connectTimeout = 15000
+        activeConnection.readTimeout = 600000
 
-        // Build a JSON payload with prompt and file contents if any
-        // For files, we could read their contents and embed them
-        val fileDataBuilder = StringBuilder()
+        val filePayloads = JSONArray()
         files.forEach { file ->
-            try {
-                val inputStream = context.contentResolver.openInputStream(file.uri)
-                val content = inputStream?.bufferedReader()?.use { it.readText() } ?: ""
-                fileDataBuilder.append("\nFile: ${file.name}\n$content\n---")
-            } catch (e: Exception) {
-                fileDataBuilder.append("\nFailed to read file ${file.name}: ${e.message}\n---")
+            val bytes = context.contentResolver.openInputStream(file.uri)?.use { input ->
+                input.readBytes()
+            } ?: throw IllegalArgumentException("Could not read ${file.name}")
+            if (bytes.size > MAX_ATTACHMENT_BYTES) {
+                throw IllegalArgumentException("${file.name} is larger than 20 MB")
             }
+            filePayloads.put(
+                JSONObject()
+                    .put("name", file.name)
+                    .put(
+                        "mimeType",
+                        context.contentResolver.getType(file.uri) ?: "application/octet-stream"
+                    )
+                    .put("base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+            )
         }
 
-        val fullPrompt = if (files.isNotEmpty()) {
-            "Prompt: $prompt\n\nAttached files context:$fileDataBuilder"
-        } else {
-            prompt
-        }
+        val payload = JSONObject()
+            .put("prompt", prompt)
+            .put("files", filePayloads)
+            .toString()
 
-        // Extremely simple JSON escaping
-        val escapedPrompt = fullPrompt.replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
-        val payload = "{\"prompt\": \"$escapedPrompt\"}"
-
-        connection.outputStream.use { os ->
+        activeConnection.outputStream.use { os ->
             os.write(payload.toByteArray(Charsets.UTF_8))
         }
 
-        if (connection.responseCode == 200) {
-            val response = connection.inputStream.bufferedReader().use { it.readText() }
-            // Extract the result text from JSON response or use directly
-            response
+        val responseCode = activeConnection.responseCode
+        val responseStream = if (responseCode in 200..299) {
+            activeConnection.inputStream
         } else {
-            "Server Error: ${connection.responseCode} - ${connection.responseMessage}"
+            activeConnection.errorStream
+        }
+        val responseBody = responseStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        if (responseCode in 200..299) {
+            responseBody
+        } else {
+            "Server Error $responseCode: ${responseBody.ifBlank { activeConnection.responseMessage }}"
         }
     } catch (e: Exception) {
-        "Failed to connect to Antigravity Termux Backend at $serverUrl.\nError: ${e.localizedMessage}\n\nMake sure your server is running in Termux using:\n$ agy --server"
+        "Failed to send request to Antigravity at $serverUrl.\nError: ${e.localizedMessage}"
+    } finally {
+        connection?.disconnect()
     }
 }
+
+private const val MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
